@@ -285,6 +285,13 @@ def get_requirement(dep):
     """
     path = None
     uri = None
+    editable = False
+    dep_link = None
+    # check for editable dep / vcs dep
+    if isinstance(dep, six.string_types) and dep.startswith('-e '):
+        editable = True
+        # Use the user supplied path as the written dependency
+        dep = dep.split(' ', 1)[1]
     # Split out markers if they are present - similar to how pip does it
     # See pip.req.req_install.InstallRequirement.from_line
     if not any(dep.startswith(uri_prefix) for uri_prefix in SCHEME_LIST):
@@ -313,13 +320,34 @@ def get_requirement(dep):
                 else:
                     path = get_converted_relative_path(dep)
                 dep = dep_link.egg_fragment if dep_link.egg_fragment else dep_link.url_without_fragment
+    elif is_vcs(dep):
+        # Generate a Link object for parsing egg fragments
+        dep_link = Link(dep)
+        # Save the original path to store in the pipfile
+        uri = dep_link.path
+        # Construct the requirement using proper git+ssh:// replaced uris or names if available
+        dep = clean_vcs_uri(dep)
+    if editable:
+        dep = '-e {0}'.format(dep)
     req = [r for r in requirements.parse(dep)][0]
+    # if all we built was the requirement name and still need eveerything else
+    if req.name and not any([req.uri, req.path]):
+        if dep_link:
+            if dep_link.scheme.startswith('file') and path and not req.path:
+                req.path = path
+                req.local_file = True
+                req.uri = None
+            else:
+                req.uri = dep_link.url_without_fragment
     # If the result is a local file with a URI and we have a local path, unset the URI
     # and set the path instead
-    if path and not req.path:
+    elif req.local_file and req.uri and not req.path and path:
         req.path = path
         req.uri = None
-        req.local_file = True
+    elif req.vcs and req.uri and uri != req.uri:
+        req.uri = uri
+    if editable and not req.editable:
+        req.editable = True
     if markers:
         req.markers = markers
     if extras:
@@ -856,16 +884,22 @@ def is_required_version(version, specified_version):
     return True
 
 
+def clean_vcs_uri(uri):
+    """Cleans VCS uris from pip format"""
+    if isinstance(uri, six.string_types):
+        # Add scheme for parsing purposes, this is also what pip does
+        if uri.startswith('git+') and '://' not in uri:
+            uri = uri.replace('git+', 'git+ssh://')
+    return uri
+
+
 def is_vcs(pipfile_entry):
     """Determine if dictionary entry from Pipfile is for a vcs dependency."""
 
     if hasattr(pipfile_entry, 'keys'):
         return any(key for key in pipfile_entry.keys() if key in VCS_LIST)
     elif isinstance(pipfile_entry, six.string_types):
-        # Add scheme for parsing purposes, this is also what pip does
-        if pipfile_entry.startswith('git+') and '://' not in pipfile_entry:
-            pipfile_entry = pipfile_entry.replace('git+', 'git+ssh://')
-        return bool(requirements.requirement.VCS_REGEX.match(pipfile_entry))
+        return bool(requirements.requirement.VCS_REGEX.match(clean_vcs_uri(pipfile_entry)))
     return False
 
 
